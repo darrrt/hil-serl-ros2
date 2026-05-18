@@ -63,7 +63,7 @@
       target_joint_positions: [0.0, 0.168, 0.557, -2.193, -1.1723, 1.186, 0.110]
       motion_duration: 10.0
       gripper_force: 5.0
-      gripper_width: 0.04
+      gripper_width: 0.01
       gripper_speed: 0.1
       slide_start_x: 0.4
       slide_start_y: 0.0

@@ -31,6 +31,7 @@ from geometry_msgs.msg import PoseStamped
 from franka_msgs.action import Grasp, Homing, Move
 from controller_manager_msgs.srv import SwitchController
 from std_srvs.srv import Trigger
+from sensor_msgs.msg import JointState
 
 
 class TaskSequenceNode(Node):
@@ -44,9 +45,9 @@ class TaskSequenceNode(Node):
         # 关节运动等待时间（秒）
         self.declare_parameter('motion_duration', 10.0)
         # 夹爪抓取力（牛顿）
-        self.declare_parameter('gripper_force', 5.0)
+        self.declare_parameter('gripper_force', 1.0)
         # 夹爪宽度（米）
-        self.declare_parameter('gripper_width', 0.04)
+        self.declare_parameter('gripper_width', 0.01)
         # 夹爪运动速度（米/秒）
         self.declare_parameter('gripper_speed', 0.1)
         # 滑动起点X坐标（米）
@@ -105,12 +106,47 @@ class TaskSequenceNode(Node):
             Trigger, '~/start', self.trigger_callback,
             callback_group=self.cb_group)
 
+        # ============ 夹爪状态订阅器 ============
+        # 订阅夹爪关节状态，用于实时监控夹爪状态
+        self.gripper_joint_state_sub = self.create_subscription(
+            JointState,
+            f'/{self.gripper_ns}/joint_states',
+            self.gripper_state_callback,
+            10,
+            callback_group=self.cb_group)
+        
+        # 夹爪状态变量
+        self.current_gripper_width = 0.0
+        self.current_gripper_force = 0.0
+        self.gripper_state_received = False
+
         self.get_logger().info('任务序列节点已初始化. 等待服务连接...')
 
         # 自动启动逻辑
         if self.get_parameter('auto_start').value:
             self.get_logger().info('自动启动已启用. 3秒后开始任务序列...')
             self.auto_start_timer = self.create_timer(3.0, self._auto_start_callback)
+
+    def gripper_state_callback(self, msg):
+        """
+        夹爪关节状态回调函数
+        
+        Franka夹爪的joint_states包含：
+        - position: [finger_joint1_position, finger_joint2_position] 每个手指的位置
+        - velocity: [finger_joint1_velocity, finger_joint2_velocity] 每个手指的速度
+        - effort: [finger_joint1_effort, finger_joint2_effort] 每个手指的力（单位：N）
+        
+        夹爪总宽度 = finger_joint1_position + finger_joint2_position
+        夹爪总力 = finger_joint1_effort + finger_joint2_effort
+        """
+        if len(msg.position) >= 2:
+            # 夹爪宽度 = 两个手指位置之和
+            self.current_gripper_width = msg.position[0] + msg.position[1]
+            self.gripper_state_received = True
+        
+        if len(msg.effort) >= 2:
+            # 夹爪力 = 两个手指力之和（绝对值，因为可能为负）
+            self.current_gripper_force = abs(msg.effort[0]) + abs(msg.effort[1])
 
     def _auto_start_callback(self):
         """自动启动回调函数"""
@@ -178,13 +214,18 @@ class TaskSequenceNode(Node):
             self.get_logger().error(f'  错误: 最小宽度 {min_width:.4f}m <= 0，请增大 gripper_width 或减小 epsilon_inner')
             return False
         
+        self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
+        
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             self.get_logger().info(f'  抓取尝试 ({attempt}/{max_retries})...')
 
             if not self.move_gripper(0.08):
                 self.get_logger().error('  张开夹爪失败')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
                 continue
+
+            self.get_logger().info(f'  夹爪张开完成，当前宽度: {self.current_gripper_width:.4f}m')
 
             if not self.grasp_client.wait_for_server(timeout_sec=5.0):
                 self.get_logger().error('  抓取动作服务器不可用')
@@ -202,25 +243,69 @@ class TaskSequenceNode(Node):
             future = self.grasp_client.send_goal_async(goal)
             rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
 
-            if future.result() is None or not future.result().accepted:
-                self.get_logger().warn(f'第{attempt}次抓取被拒绝或超时，准备重试...')
+            if future.result() is None:
+                self.get_logger().error(f'  第{attempt}次抓取: 请求超时')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
+                continue
+            
+            if not future.result().accepted:
+                self.get_logger().warn(f'  第{attempt}次抓取: 目标被拒绝')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
                 continue
 
+            self.get_logger().info('  抓取目标已接受，等待执行结果...')
+            
             result_future = future.result().get_result_async()
             rclpy.spin_until_future_complete(self, result_future, timeout_sec=15.0)
 
             if result_future.result() is None:
-                self.get_logger().warn(f'第{attempt}次抓取结果超时，准备重试...')
+                self.get_logger().error(f'  第{attempt}次抓取: 结果超时')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
                 continue
 
-            if result_future.result().result.success:
-                self.get_logger().info(f'第{attempt}次抓取成功!')
+            result = result_future.result().result
+            
+            if result.success:
+                self.get_logger().info(f'  第{attempt}次抓取成功!')
+                self.get_logger().info(f'  抓取后夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
                 return True
             else:
-                self.get_logger().warn(f'第{attempt}次抓取执行失败，准备重试...')
+                error_msg = result.error if result.error else "未知错误"
+                self.get_logger().error(f'  第{attempt}次抓取失败! 错误信息: {error_msg}')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
+                self.analyze_grasp_failure(attempt, gripper_width, min_width, goal.force)
 
         self.get_logger().error(f'抓取失败: 已重试{max_retries}次，均未成功')
         return False
+
+    def analyze_grasp_failure(self, attempt, target_width, min_width, force):
+        """
+        分析抓取失败原因并给出建议
+        
+        Franka夹爪常见抓取失败原因：
+        1. 目标宽度设置不当
+        2. 抓取力不足或过大
+        3. epsilon参数设置不当
+        4. 物体尺寸与目标宽度不匹配
+        5. 夹爪未正确张开
+        """
+        self.get_logger().info(f'  --- 抓取失败分析 (第{attempt}次尝试) ---')
+        self.get_logger().info(f'  目标宽度: {target_width:.4f}m, 最小宽度: {min_width:.4f}m')
+        self.get_logger().info(f'  当前宽度: {self.current_gripper_width:.4f}m, 当前力: {self.current_gripper_force:.2f}N')
+        self.get_logger().info(f'  设定抓取力: {force}N')
+        
+        if self.current_gripper_width > 0.075:
+            self.get_logger().warn(f'  警告: 夹爪当前宽度({self.current_gripper_width:.4f}m)接近最大宽度(0.08m)')
+            self.get_logger().warn(f'        可能是物体尺寸超过夹爪最大张开范围')
+        
+        if self.current_gripper_width < min_width:
+            self.get_logger().warn(f'  警告: 当前宽度({self.current_gripper_width:.4f}m)小于最小宽度({min_width:.4f}m)')
+            self.get_logger().warn(f'        可能是物体尺寸过小或目标宽度设置过大')
+        
+        if force < 2.0:
+            self.get_logger().warn(f'  警告: 抓取力({force}N)过小，可能无法牢固抓取')
+        elif force > 20.0:
+            self.get_logger().warn(f'  警告: 抓取力({force}N)过大，可能损坏物体')
 
     def move_gripper(self, width):
         """
