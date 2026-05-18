@@ -4,17 +4,20 @@ In a screen run `python franka_server.py`
 """
 from flask import Flask, request, jsonify
 import numpy as np
-import rospy
 import time
 import subprocess
+import threading
 from scipy.spatial.transform import Rotation as R
 from absl import app, flags
 
-from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from franka_msgs.action import ErrorRecovery
+from franka_msgs.msg import FrankaRobotState
 from franka_msgs.srv import SetLoad
 from serl_franka_controllers.msg import ZeroJacobian
 import geometry_msgs.msg as geom_msg
-from dynamic_reconfigure.client import Client as ReconfClient
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
@@ -31,86 +34,91 @@ flags.DEFINE_list(
     [0, 0, 0, -1.9, -0, 2, 0],
     "Target joint angles for the robot to reset to",
 )
-flags.DEFINE_string("flask_url", 
-    "127.0.0.1",
-    "URL for the flask server to run on."
+flags.DEFINE_string(
+    "flask_url", "127.0.0.1", "URL for the flask server to run on."
 )
-flags.DEFINE_string("ros_port", "11311", "Port for the ROS master to run on.")
+flags.DEFINE_string(
+    "launch_robot_ip", "172.16.0.2",
+    "Robot IP for the launch file (may differ from robot_ip)"
+)
 
 
 class FrankaServer:
     """Handles the starting and stopping of the impedance controller
     (as well as backup) joint recovery policy."""
 
-    def __init__(self, robot_ip, gripper_type, ros_pkg_name, reset_joint_target):
+    def __init__(self, node, robot_ip, gripper_type, ros_pkg_name, reset_joint_target):
+        self.node = node
         self.robot_ip = robot_ip
         self.ros_pkg_name = ros_pkg_name
         self.reset_joint_target = reset_joint_target
         self.gripper_type = gripper_type
 
-        self.eepub = rospy.Publisher(
-            "/cartesian_impedance_controller/equilibrium_pose",
+        self.eepub = node.create_publisher(
             geom_msg.PoseStamped,
-            queue_size=10,
+            "/cartesian_impedance_controller/equilibrium_pose",
+            10,
         )
-        self.resetpub = rospy.Publisher(
-            "/franka_control/error_recovery/goal", ErrorRecoveryActionGoal, queue_size=1
+        self.recovery_client = ActionClient(
+            node, ErrorRecovery, "/franka_control/error_recovery"
         )
-        self.jacobian_sub = rospy.Subscriber(
-            "/cartesian_impedance_controller/franka_jacobian",
+        self.jacobian_sub = node.create_subscription(
             ZeroJacobian,
+            "/cartesian_impedance_controller/franka_jacobian",
             self._set_jacobian,
+            10,
         )
         time.sleep(1)
-        self.state_sub = rospy.Subscriber(
-            "franka_state_controller/franka_states", FrankaState, self._set_currpos
+        self.state_sub = node.create_subscription(
+            FrankaRobotState,
+            "franka_robot_state_broadcaster/franka_robot_state",
+            self._set_currpos,
+            10,
         )
 
     def start_impedance(self):
         """Launches the impedance controller"""
         self.imp = subprocess.Popen(
             [
-                "roslaunch",
+                "ros2",
+                "launch",
                 self.ros_pkg_name,
-                "impedance.launch",
+                "impedance.launch.py",
                 "robot_ip:=" + self.robot_ip,
                 f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
             ],
             stdout=subprocess.PIPE,
         )
-        time.sleep(3)
+        time.sleep(5)
 
     def stop_impedance(self):
         """Stops the impedance controller"""
         self.imp.terminate()
+        self.imp.wait()
         time.sleep(1)
 
     def clear(self):
         """Clears any errors"""
-        msg = ErrorRecoveryActionGoal()
-        self.resetpub.publish(msg)
+        self.recovery_client.wait_for_server()
+        goal = ErrorRecovery.Goal()
+        self.recovery_client.send_goal_async(goal)
 
     def reset_joint(self):
         """Resets Joints (needed after running for hours)"""
-        # First Stop impedance
         try:
             self.stop_impedance()
             self.clear()
-        except:
+        except Exception:
             print("impedance Not Running")
         time.sleep(3)
         self.clear()
 
-        # Launch joint controller reset
-        # set rosparm with rospkg
-        # rosparam set /target_joint_positions '[q1, q2, q3, q4, q5, q6, q7]'
-        rospy.set_param("/target_joint_positions", self.reset_joint_target)
-
         self.joint_controller = subprocess.Popen(
             [
-                "roslaunch",
+                "ros2",
+                "launch",
                 self.ros_pkg_name,
-                "joint.launch",
+                "joint.launch.py",
                 "robot_ip:=" + self.robot_ip,
                 f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
             ],
@@ -120,7 +128,6 @@ class FrankaServer:
         print("RUNNING JOINT RESET")
         self.clear()
 
-        # Wait until target joint angles are reached
         count = 0
         time.sleep(1)
         while not np.allclose(
@@ -135,14 +142,13 @@ class FrankaServer:
                 print("joint reset TIMEOUT")
                 break
 
-        # Stop joint controller
         print("RESET DONE")
         self.joint_controller.terminate()
+        self.joint_controller.wait()
         time.sleep(1)
         self.clear()
         print("KILLED JOINT RESET", self.pos)
 
-        # Restart impedece controller
         self.start_impedance()
         print("impedance STARTED")
 
@@ -151,32 +157,40 @@ class FrankaServer:
         assert len(pose) == 7
         msg = geom_msg.PoseStamped()
         msg.header.frame_id = "0"
-        msg.header.stamp = rospy.Time.now()
-        msg.pose.position = geom_msg.Point(pose[0], pose[1], pose[2])
-        msg.pose.orientation = geom_msg.Quaternion(pose[3], pose[4], pose[5], pose[6])
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.pose.position = geom_msg.Point(x=pose[0], y=pose[1], z=pose[2])
+        msg.pose.orientation = geom_msg.Quaternion(
+            x=pose[3], y=pose[4], z=pose[5], w=pose[6]
+        )
         self.eepub.publish(msg)
 
     def _set_currpos(self, msg):
-        tmatrix = np.array(list(msg.O_T_EE)).reshape(4, 4).T
-        r = R.from_matrix(tmatrix[:3, :3])
-        pose = np.concatenate([tmatrix[:3, -1], r.as_quat()])
-        self.pos = pose
-        self.dq = np.array(list(msg.dq)).reshape((7,))
-        self.q = np.array(list(msg.q)).reshape((7,))
-        self.force = np.array(list(msg.K_F_ext_hat_K)[:3])
-        self.torque = np.array(list(msg.K_F_ext_hat_K)[3:])
+        o_t_ee = msg.o_t_ee
+        pos_vec = o_t_ee.pose.position
+        ori = o_t_ee.pose.orientation
+        r = R.from_quat([ori.x, ori.y, ori.z, ori.w])
+        self.pos = np.array([pos_vec.x, pos_vec.y, pos_vec.z, ori.x, ori.y, ori.z, ori.w])
+
+        measured = msg.measured_joint_state
+        self.q = np.array(list(measured.position))
+        self.dq = np.array(list(measured.velocity))
+
+        k_f_ext = msg.k_f_ext_hat_k
+        self.force = np.array([k_f_ext.wrench.force.x, k_f_ext.wrench.force.y, k_f_ext.wrench.force.z])
+        self.torque = np.array([k_f_ext.wrench.torque.x, k_f_ext.wrench.torque.y, k_f_ext.wrench.torque.z])
         try:
             self.vel = self.jacobian @ self.dq
-        except:
+        except Exception:
             self.vel = np.zeros(6)
-            rospy.logwarn("Jacobian not set, end-effector velocity temporarily not available")
+            self.node.get_logger().warn("Jacobian not set, end-effector velocity temporarily not available")
 
     def _set_jacobian(self, msg):
         jacobian = np.array(list(msg.zero_jacobian)).reshape((6, 7), order="F")
         self.jacobian = jacobian
 
 
-###############################################################################
+def spin_thread(executor):
+    executor.spin()
 
 
 def main(_):
@@ -187,16 +201,10 @@ def main(_):
     GRIPPER_TYPE = FLAGS.gripper_type
     RESET_JOINT_TARGET = FLAGS.reset_joint_target
 
+    rclpy.init()
+    node = rclpy.create_node("franka_control_api")
+
     webapp = Flask(__name__)
-
-    try:
-        roscore = subprocess.Popen(f"roscore -p {FLAGS.ros_port}", shell=True)
-        time.sleep(1)
-    except Exception as e:
-        raise Exception("roscore not running", e)
-
-    # Start ros node
-    rospy.init_node("franka_control_api")
 
     if GRIPPER_TYPE == "Robotiq":
         from robot_servers.robotiq_gripper_server import RobotiqGripperServer
@@ -207,12 +215,12 @@ def main(_):
 
         gripper_server = FrankaGripperServer()
     elif GRIPPER_TYPE == "None":
-        pass
+        gripper_server = None
     else:
         raise NotImplementedError("Gripper Type Not Implemented")
 
-    """Starts impedance controller"""
     robot_server = FrankaServer(
+        node=node,
         robot_ip=ROBOT_IP,
         gripper_type=GRIPPER_TYPE,
         ros_pkg_name=ROS_PKG_NAME,
@@ -220,46 +228,50 @@ def main(_):
     )
     robot_server.start_impedance()
 
-    reconf_client = ReconfClient(
-        "cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node"
-    )
+    set_load_client = node.create_client(SetLoad, '/franka_control/set_load')
 
-    rospy.wait_for_service('/franka_control/set_load')
-    set_load_service = rospy.ServiceProxy('/franka_control/set_load', SetLoad)
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    if GRIPPER_TYPE == "Franka":
+        executor.add_node(gripper_server.node)
+    elif GRIPPER_TYPE == "Robotiq":
+        executor.add_node(gripper_server.node)
 
+    spin_thread_obj = threading.Thread(target=spin_thread, args=(executor,), daemon=True)
+    spin_thread_obj.start()
 
-    # Route for Setting Load
     @webapp.route("/set_load", methods=["POST"])
     def set_load():
         data = request.json
-        mass = data['mass']
+        mass = float(data['mass'])
         F_x_center_load = data['F_x_center_load']
         load_inertia = data['load_inertia']
-        set_load_service(mass, F_x_center_load, load_inertia)
+        req = SetLoad.Request()
+        req.mass = mass
+        req.center_of_mass = F_x_center_load
+        req.load_inertia = load_inertia
+        set_load_client.wait_for_service()
+        set_load_client.call_async(req)
         print("Set mass to", mass)
         return "Set Load"
 
-    # Route for Starting impedance
     @webapp.route("/startimp", methods=["POST"])
     def start_impedance():
         robot_server.clear()
         robot_server.start_impedance()
         return "Started impedance"
 
-    # Route for Stopping impedance
     @webapp.route("/stopimp", methods=["POST"])
     def stop_impedance():
         robot_server.stop_impedance()
         return "Stopped impedance"
-    
-    # Route for pose in euler angles
+
     @webapp.route("/getpos_euler", methods=["POST"])
     def get_pose_euler():
         xyz = robot_server.pos[:3]
         r = R.from_quat(robot_server.pos[3:]).as_euler("xyz")
         return jsonify({"pose": np.concatenate([xyz, r]).tolist()})
 
-    # Route for Getting Pose
     @webapp.route("/getpos", methods=["POST"])
     def get_pos():
         return jsonify({"pose": np.array(robot_server.pos).tolist()})
@@ -288,77 +300,71 @@ def main(_):
     def get_jacobian():
         return jsonify({"jacobian": np.array(robot_server.jacobian).tolist()})
 
-    # Route for getting gripper distance
     @webapp.route("/get_gripper", methods=["POST"])
     def get_gripper():
-        return jsonify({"gripper": gripper_server.gripper_pos})
+        return jsonify({"gripper": gripper_server.gripper_pos if gripper_server else 0.0})
 
-    # Route for Running Joint Reset
     @webapp.route("/jointreset", methods=["POST"])
     def joint_reset():
         robot_server.clear()
         robot_server.reset_joint()
         return "Reset Joint"
 
-    # Route for Activating the Gripper
     @webapp.route("/activate_gripper", methods=["POST"])
     def activate_gripper():
         print("activate gripper")
-        gripper_server.activate_gripper()
+        if gripper_server:
+            gripper_server.activate_gripper()
         return "Activated"
 
-    # Route for Resetting the Gripper. It will reset and activate the gripper
     @webapp.route("/reset_gripper", methods=["POST"])
     def reset_gripper():
         print("reset gripper")
-        gripper_server.reset_gripper()
+        if gripper_server:
+            gripper_server.reset_gripper()
         return "Reset"
 
-    # Route for Opening the Gripper
     @webapp.route("/open_gripper", methods=["POST"])
     def open():
         print("open")
-        gripper_server.open()
+        if gripper_server:
+            gripper_server.open()
         return "Opened"
 
-    # Route for Closing the Gripper
     @webapp.route("/close_gripper", methods=["POST"])
     def close():
         print("close")
-        gripper_server.close()
+        if gripper_server:
+            gripper_server.close()
         return "Closed"
 
-    # Route for Closing the Gripper
     @webapp.route("/close_gripper_slow", methods=["POST"])
     def close_slow():
-        print("close")
-        gripper_server.close_slow()
+        print("close slow")
+        if gripper_server:
+            gripper_server.close_slow()
         return "Closed"
 
-    # Route for moving the gripper
     @webapp.route("/move_gripper", methods=["POST"])
     def move_gripper():
         gripper_pos = request.json
-        pos = np.clip(int(gripper_pos["gripper_pos"]), 0, 255)  # 0-255
+        pos = np.clip(int(gripper_pos["gripper_pos"]), 0, 255)
         print(f"move gripper to {pos}")
-        gripper_server.move(pos)
+        if gripper_server:
+            gripper_server.move(pos)
         return "Moved Gripper"
 
-    # Route for Clearing Errors (Communcation constraints, etc.)
     @webapp.route("/clearerr", methods=["POST"])
     def clear():
         robot_server.clear()
         return "Clear"
 
-    # Route for Sending a pose command
     @webapp.route("/pose", methods=["POST"])
     def pose():
         pos = np.array(request.json["arr"])
-        # print("Moving to", pos)
         robot_server.move(pos)
         return "Moved"
 
-    # Route for getting all state information
     @webapp.route("/getstate", methods=["POST"])
     def get_state():
         return jsonify(
@@ -370,14 +376,16 @@ def main(_):
                 "q": np.array(robot_server.q).tolist(),
                 "dq": np.array(robot_server.dq).tolist(),
                 "jacobian": np.array(robot_server.jacobian).tolist(),
-                "gripper_pos": gripper_server.gripper_pos,
+                "gripper_pos": gripper_server.gripper_pos if gripper_server else 0.0,
             }
         )
 
-    # Route for updating compliance parameters
     @webapp.route("/update_param", methods=["POST"])
     def update_param():
-        reconf_client.update_configuration(request.json)
+        params = request.json
+        for key, value in params.items():
+            param = rclpy.parameter.Parameter(key, value=value)
+            node.set_parameters([param])
         return "Updated compliance parameters"
 
     webapp.run(host=FLAGS.flask_url)

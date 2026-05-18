@@ -8,6 +8,9 @@ class GripperServer:
     def close(self):
         pass
 
+    def close_slow(self):
+        pass
+
     def move(self, position: int):
         pass
 

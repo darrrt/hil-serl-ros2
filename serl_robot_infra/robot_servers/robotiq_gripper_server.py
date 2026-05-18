@@ -1,5 +1,6 @@
 import subprocess
-import rospy
+import rclpy
+from rclpy.node import Node
 from robotiq_2f_gripper_control.msg import _Robotiq2FGripper_robot_output as outputMsg
 from robotiq_2f_gripper_control.msg import _Robotiq2FGripper_robot_input as inputMsg
 
@@ -9,25 +10,28 @@ from robot_servers.gripper_server import GripperServer
 class RobotiqGripperServer(GripperServer):
     def __init__(self, gripper_ip):
         super().__init__()
+        self.node = rclpy.create_node('robotiq_gripper_server')
+
         self.gripper = subprocess.Popen(
             [
-                "rosrun",
+                "ros2",
+                "run",
                 "robotiq_2f_gripper_control",
                 "Robotiq2FGripperTcpNode.py",
                 gripper_ip,
             ],
             stdout=subprocess.PIPE,
         )
-        self.gripper_state_sub = rospy.Subscriber(
-            "Robotiq2FGripperRobotInput",
+        self.gripper_state_sub = self.node.create_subscription(
             inputMsg.Robotiq2FGripper_robot_input,
+            "Robotiq2FGripperRobotInput",
             self._update_gripper,
-            queue_size=1,
+            10,
         )
-        self.gripperpub = rospy.Publisher(
-            "Robotiq2FGripperRobotOutput",
+        self.gripperpub = self.node.create_publisher(
             outputMsg.Robotiq2FGripper_robot_output,
-            queue_size=1,
+            "Robotiq2FGripperRobotOutput",
+            10,
         )
         self.gripper_command = outputMsg.Robotiq2FGripper_robot_output()
 
@@ -57,11 +61,9 @@ class RobotiqGripperServer(GripperServer):
         self.gripperpub.publish(self.gripper_command)
 
     def _update_gripper(self, msg):
-        """internal callback to get the latest gripper position."""
         self.gripper_pos = 1 - msg.gPO / 255
 
     def _generate_gripper_command(self, char, command):
-        """Update the gripper command according to the character entered by the user."""
         if char == "a":
             command = outputMsg.Robotiq2FGripper_robot_output()
             command.rACT = 1
@@ -77,7 +79,7 @@ class RobotiqGripperServer(GripperServer):
         elif char == "c":
             command.rPR = 255
             command.rSP = 255
-        
+
         elif char == "cs":
             command.rPR = 255
             command.rSP = 50
@@ -86,8 +88,6 @@ class RobotiqGripperServer(GripperServer):
             command.rPR = 175
             command.rSP = 255
 
-        # If the command entered is a int, assign this value to rPR
-        # (i.e., move to this position)
         try:
             command.rPR = int(char)
             if command.rPR > 255:
