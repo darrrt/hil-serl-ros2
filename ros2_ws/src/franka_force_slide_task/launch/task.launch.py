@@ -87,6 +87,7 @@ def generate_robot_nodes(context):
             executable='spawner',
             namespace=namespace,
             arguments=['joint_position_controller'],
+            # - 立即激活，立即开始移动到目标位 - 运动持续 10 秒
             output='screen',
         ),
         Node(
@@ -94,6 +95,7 @@ def generate_robot_nodes(context):
             executable='spawner',
             namespace=namespace,
             arguments=['cartesian_impedance_force_controller', '--inactive'],
+            # 以 INACTIVE 状态启动，不运行直到被激
             output='screen',
         ),
         IncludeLaunchDescription(

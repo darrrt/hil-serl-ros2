@@ -170,47 +170,95 @@ class TaskSequenceNode(Node):
         self.get_logger().info('=== 任务序列完成 ===')
 
     def grasp_tool(self):
-        """
-        控制夹爪抓取视触觉传感器
+        gripper_width = self.get_parameter('gripper_width').value
+        epsilon_inner = 0.005
+        min_width = gripper_width - epsilon_inner
         
-        Returns:
-            bool: 抓取成功返回True，失败返回False
+        if min_width <= 0.0:
+            self.get_logger().error(f'  错误: 最小宽度 {min_width:.4f}m <= 0，请增大 gripper_width 或减小 epsilon_inner')
+            return False
+        
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            self.get_logger().info(f'  抓取尝试 ({attempt}/{max_retries})...')
+
+            if not self.move_gripper(0.08):
+                self.get_logger().error('  张开夹爪失败')
+                continue
+
+            if not self.grasp_client.wait_for_server(timeout_sec=5.0):
+                self.get_logger().error('  抓取动作服务器不可用')
+                continue
+
+            goal = Grasp.Goal()
+            goal.width = gripper_width
+            goal.speed = self.get_parameter('gripper_speed').value
+            goal.force = self.get_parameter('gripper_force').value
+            goal.epsilon.inner = epsilon_inner
+            goal.epsilon.outer = 0.005
+
+            self.get_logger().info(f'  执行抓取: width={goal.width}m, min_width={min_width:.4f}m, force={goal.force}N')
+
+            future = self.grasp_client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+
+            if future.result() is None or not future.result().accepted:
+                self.get_logger().warn(f'第{attempt}次抓取被拒绝或超时，准备重试...')
+                continue
+
+            result_future = future.result().get_result_async()
+            rclpy.spin_until_future_complete(self, result_future, timeout_sec=15.0)
+
+            if result_future.result() is None:
+                self.get_logger().warn(f'第{attempt}次抓取结果超时，准备重试...')
+                continue
+
+            if result_future.result().result.success:
+                self.get_logger().info(f'第{attempt}次抓取成功!')
+                return True
+            else:
+                self.get_logger().warn(f'第{attempt}次抓取执行失败，准备重试...')
+
+        self.get_logger().error(f'抓取失败: 已重试{max_retries}次，均未成功')
+        return False
+
+    def move_gripper(self, width):
         """
-        # 等待抓取动作服务器启动
-        if not self.grasp_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error('抓取动作服务器不可用!')
+        移动夹爪到指定宽度
+        
+        Args:
+            width (float): 目标宽度（米）
+            
+        Returns:
+            bool: 移动成功返回True，失败返回False
+        """
+        if not self.move_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('夹爪移动动作服务器不可用!')
             return False
 
-        # 创建抓取目标
-        goal = Grasp.Goal()
-        goal.width = self.get_parameter('gripper_width').value      # 抓取宽度
-        goal.speed = self.get_parameter('gripper_speed').value      # 夹爪运动速度
-        goal.force = self.get_parameter('gripper_force').value      # 抓取力
-        goal.epsilon.inner = 0.005   # 内边界容差（米）
-        goal.epsilon.outer = 0.005   # 外边界容差（米）
+        goal = Move.Goal()
+        goal.width = width
+        goal.speed = 0.1
 
-        self.get_logger().info(
-            f'  抓取参数: width={goal.width}m, speed={goal.speed}m/s, force={goal.force}N')
+        self.get_logger().info(f'  移动夹爪到宽度: {width}m')
 
-        # 发送异步抓取目标
-        future = self.grasp_client.send_goal_async(goal)
+        future = self.move_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
 
         if future.result() is None:
-            self.get_logger().error('  抓取目标被拒绝或超时.')
+            self.get_logger().error('  夹爪移动目标被拒绝或超时.')
             return False
 
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error('  抓取目标被拒绝.')
+            self.get_logger().error('  夹爪移动目标被拒绝.')
             return False
 
-        # 等待抓取结果
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future, timeout_sec=15.0)
 
         if result_future.result() is None:
-            self.get_logger().error('  抓取结果超时.')
+            self.get_logger().error('  夹爪移动结果超时.')
             return False
 
         return result_future.result().result.success
