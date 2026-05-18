@@ -1,0 +1,76 @@
+/**:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000
+      thread_priority: 98
+
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+
+      franka_robot_state_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+
+      joint_position_controller:
+        type: serl_franka_controllers/JointPositionController
+
+      cartesian_impedance_force_controller:
+        type: franka_force_slide_task/CartesianImpedanceForceController
+
+/**:
+  franka_robot_state_broadcaster:
+    ros__parameters:
+      arm_id: "fr3"
+      lock_try_count: 5
+      lock_sleep_interval: 5
+      lock_log_error: true
+      lock_update_success: false
+
+/**:
+  joint_state_broadcaster:
+    ros__parameters:
+      joints:
+        - fr3_joint1
+        - fr3_joint2
+        - fr3_joint3
+        - fr3_joint4
+        - fr3_joint5
+        - fr3_joint6
+        - fr3_joint7
+
+/**:
+  joint_position_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      target_joint_positions: [0.0, 0.168, 0.557, -2.193, -1.1723, 1.186, 0.110]
+      k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      d_gains: [50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0]
+
+/**:
+  cartesian_impedance_force_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      desired_force_z: 5.0
+      z_damping: 15.0
+      xy_stiffness: 2000.0
+      xy_damping: 89.0
+      rot_stiffness: 30.0
+      rot_damping: 5.0
+      force_filter_coeff: 0.01
+
+/**:
+  task_sequence_node:
+    ros__parameters:
+      target_joint_positions: [0.0, 0.168, 0.557, -2.193, -1.1723, 1.186, 0.110]
+      motion_duration: 10.0
+      gripper_force: 5.0
+      gripper_width: 0.04
+      gripper_speed: 0.1
+      slide_start_x: 0.4
+      slide_start_y: 0.0
+      slide_end_x: 0.6
+      slide_end_y: 0.2
+      slide_speed: 0.02
+      slide_z_height: 0.15
+      slide_orientation: [0.0, 1.0, 0.0, 0.0]
+      auto_start: true
+      gripper_namespace: "franka_gripper"

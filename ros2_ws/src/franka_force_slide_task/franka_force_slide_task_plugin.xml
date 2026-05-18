@@ -1,0 +1,10 @@
+<library path="franka_force_slide_task">
+  <class name="franka_force_slide_task/CartesianImpedanceForceController"
+         type="franka_force_slide_task::CartesianImpedanceForceController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      A Cartesian impedance controller with hybrid force/position control.
+      XY plane: impedance position control. Z axis: admittance-based force control.
+    </description>
+  </class>
+</library>
