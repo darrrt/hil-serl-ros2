@@ -27,8 +27,9 @@ from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, WrenchStamped
 from franka_msgs.action import Grasp, Homing, Move
+from builtin_interfaces.msg import Duration
 from controller_manager_msgs.srv import SwitchController
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
@@ -95,10 +96,18 @@ class TaskSequenceNode(Node):
             callback_group=self.cb_group)
 
         # ============ 发布器初始化 ============
-        # 发布平衡姿态到笛卡尔阻抗力控制器
-        # 注：此发布器用于发送期望位姿给阻抗控制器
         self.eq_pose_pub = self.create_publisher(
             PoseStamped, '/cartesian_impedance_force_controller/equilibrium_pose', 10)
+
+        # ============ 控制器健康监控 ============
+        self.controller_healthy = False
+        self.last_force_state_time = 0.0
+        self.force_state_sub = self.create_subscription(
+            WrenchStamped,
+            '/cartesian_impedance_force_controller/force_state',
+            self._force_state_callback,
+            10,
+            callback_group=self.cb_group)
 
         # ============ 服务端初始化 ============
         # 任务触发服务（通过服务调用启动任务序列）
@@ -126,6 +135,54 @@ class TaskSequenceNode(Node):
         if self.get_parameter('auto_start').value:
             self.get_logger().info('自动启动已启用. 3秒后开始任务序列...')
             self.auto_start_timer = self.create_timer(3.0, self._auto_start_callback)
+
+    def _wait_for_future(self, future, timeout_sec=10.0):
+        """
+        轮询等待 future 完成（替代 rclpy.spin_until_future_complete）
+        
+        问题背景：execute_task_sequence 从 timer 回调中调用，
+        而 main() 中的 MultiThreadedExecutor 已经在 spin 这个 node。
+        如果在回调中再调用 rclpy.spin_until_future_complete(node, future)，
+        它会创建一个新的 SingleThreadedExecutor 并尝试 spin 同一个 node，
+        导致两个 executor 争抢同一个 node → 死锁。
+        
+        解决方案：用轮询 + time.sleep 替代。
+        MultiThreadedExecutor 的其他线程会处理服务/动作的响应回调，
+        从而将 future 标记为 done，本方法只需等待即可。
+        
+        Args:
+            future: rclpy Future 对象
+            timeout_sec: 超时时间（秒）
+        
+        Returns:
+            bool: future 在超时前完成返回 True，超时返回 False
+        """
+        start_time = time.time()
+        while not future.done():
+            if time.time() - start_time > timeout_sec:
+                return False
+            time.sleep(0.02)
+        return True
+
+    def _force_state_callback(self, msg):
+        self.controller_healthy = True
+        self.last_force_state_time = time.time()
+
+    def _check_controller_alive(self, timeout_sec=2.0):
+        if not self.controller_healthy:
+            self.get_logger().warn('  控制器尚未发布任何力状态数据，等待中...')
+            start = time.time()
+            while not self.controller_healthy and time.time() - start < timeout_sec:
+                time.sleep(0.1)
+            if not self.controller_healthy:
+                self.get_logger().error('  控制器在等待期内未发布力状态数据! 可能已崩溃。')
+                return False
+        if time.time() - self.last_force_state_time > timeout_sec:
+            self.get_logger().error(
+                f'  控制器力状态数据已中断 {time.time() - self.last_force_state_time:.1f}s! '
+                f'控制器可能已崩溃。')
+            return False
+        return True
 
     def gripper_state_callback(self, msg):
         """
@@ -191,13 +248,45 @@ class TaskSequenceNode(Node):
         # 步骤3: 切换到笛卡尔阻抗力控制器
         # 此步骤是实现恒力控制的关键：切换到支持力控制的控制器
         self.get_logger().info('步骤3: 切换到笛卡尔阻抗力控制器...')
-        if not self.switch_controller(
+        self.get_logger().info('  停用: joint_position_controller, 激活: cartesian_impedance_force_controller')
+        switch_ok = self.switch_controller(
                 deactivate=['joint_position_controller'],
-                activate=['cartesian_impedance_force_controller']):
-            self.get_logger().error('  控制器切换失败! 终止任务.')
+                activate=['cartesian_impedance_force_controller'])
+        if not switch_ok:
+            self.get_logger().error('步骤3: 控制器切换失败! 终止任务.')
+            self.get_logger().error('  请检查: 1)控制器名称是否正确 2)控制器是否已加载 3)硬件接口是否冲突')
             return
-        self.get_logger().info('  控制器切换成功.')
+        self.get_logger().info('步骤3: 控制器切换成功. 等待1秒让控制器稳定...')
         time.sleep(1.0)
+
+        if not self._check_controller_alive(timeout_sec=3.0):
+            self.get_logger().error('步骤3: 控制器切换后健康检查失败! 可能已崩溃，终止任务。')
+            return
+
+        # 步骤3.5: 预发布滑动起始位姿作为初始平衡点
+        # 控制器 on_activate 时会将 position_d_ 设为当前末端位姿，
+        # 此处先发布滑动起始位姿，让控制器通过内部滤波器平滑过渡到目标位置，
+        # 避免直接开始滑动时出现力矩突变
+        start_x = self.get_parameter('slide_start_x').value
+        start_y = self.get_parameter('slide_start_y').value
+        z_height = self.get_parameter('slide_z_height').value
+        orientation = self.get_parameter('slide_orientation').value
+        self.get_logger().info('步骤3.5: 预发布初始平衡位姿，让控制器平滑过渡...')
+        pre_pose = PoseStamped()
+        pre_pose.header.frame_id = 'fr3_link0'
+        pre_pose.header.stamp = self.get_clock().now().to_msg()
+        pre_pose.pose.position.x = start_x
+        pre_pose.pose.position.y = start_y
+        pre_pose.pose.position.z = z_height
+        pre_pose.pose.orientation.x = orientation[0]
+        pre_pose.pose.orientation.y = orientation[1]
+        pre_pose.pose.orientation.z = orientation[2]
+        pre_pose.pose.orientation.w = orientation[3]
+        for _ in range(200):
+            pre_pose.header.stamp = self.get_clock().now().to_msg()
+            self.eq_pose_pub.publish(pre_pose)
+            time.sleep(0.01)
+        self.get_logger().info('  初始平衡位姿已发布（2秒 @ 100Hz），控制器应已平滑过渡.')
 
         # 步骤4: 执行XY平面滑动（Z轴恒力控制）
         # 滑动过程中，阻抗控制器将保持Z轴恒定压力
@@ -207,7 +296,7 @@ class TaskSequenceNode(Node):
 
     def grasp_tool(self):
         gripper_width = self.get_parameter('gripper_width').value
-        epsilon_inner = 0.005
+        epsilon_inner = 0.001
         min_width = gripper_width - epsilon_inner
         
         if min_width <= 0.0:
@@ -241,7 +330,10 @@ class TaskSequenceNode(Node):
             self.get_logger().info(f'  执行抓取: width={goal.width}m, min_width={min_width:.4f}m, force={goal.force}N')
 
             future = self.grasp_client.send_goal_async(goal)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+            if not self._wait_for_future(future, timeout_sec=10.0):
+                self.get_logger().error(f'  第{attempt}次抓取: 请求超时')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
+                continue
 
             if future.result() is None:
                 self.get_logger().error(f'  第{attempt}次抓取: 请求超时')
@@ -256,7 +348,10 @@ class TaskSequenceNode(Node):
             self.get_logger().info('  抓取目标已接受，等待执行结果...')
             
             result_future = future.result().get_result_async()
-            rclpy.spin_until_future_complete(self, result_future, timeout_sec=15.0)
+            if not self._wait_for_future(result_future, timeout_sec=15.0):
+                self.get_logger().error(f'  第{attempt}次抓取: 结果超时')
+                self.get_logger().info(f'  当前夹爪状态: 宽度={self.current_gripper_width:.4f}m, 力={self.current_gripper_force:.2f}N')
+                continue
 
             if result_future.result() is None:
                 self.get_logger().error(f'  第{attempt}次抓取: 结果超时')
@@ -328,7 +423,9 @@ class TaskSequenceNode(Node):
         self.get_logger().info(f'  移动夹爪到宽度: {width}m')
 
         future = self.move_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+        if not self._wait_for_future(future, timeout_sec=10.0):
+            self.get_logger().error('  夹爪移动目标超时.')
+            return False
 
         if future.result() is None:
             self.get_logger().error('  夹爪移动目标被拒绝或超时.')
@@ -340,7 +437,9 @@ class TaskSequenceNode(Node):
             return False
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=15.0)
+        if not self._wait_for_future(result_future, timeout_sec=15.0):
+            self.get_logger().error('  夹爪移动结果超时.')
+            return False
 
         if result_future.result() is None:
             self.get_logger().error('  夹爪移动结果超时.')
@@ -362,31 +461,49 @@ class TaskSequenceNode(Node):
         Returns:
             bool: 切换成功返回True，失败返回False
         """
-        # 等待控制器切换服务
+        self.get_logger().info('  [1/4] 等待控制器切换服务可用...')
         if not self.switch_controller_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error('控制器切换服务不可用!')
+            self.get_logger().error('  [1/4] 控制器切换服务不可用! 请检查 /controller_manager/switch_controller 是否在运行')
+            self.get_logger().error('  提示: 运行 `ros2 service list | grep switch_controller` 确认服务是否存在')
             return False
+        self.get_logger().info('  [1/4] 控制器切换服务已连接.')
 
-        # 创建切换请求
         req = SwitchController.Request()
-        req.deactivate_controllers = deactivate    # 停用的控制器
-        req.activate_controllers = activate        # 激活的控制器
-        req.strictness = SwitchController.Request.BEST_EFFORT  # 尽力模式
-        req.start_asap = True     # 立即启动
-        req.timeout = 5.0         # 超时时间
+        req.deactivate_controllers = deactivate
+        req.activate_controllers = activate
+        req.strictness = SwitchController.Request.BEST_EFFORT
+        req.activate_asap = True
+        req.timeout = Duration(sec=5, nanosec=0)
 
         self.get_logger().info(
-            f'  切换控制器: 停用={deactivate}, 激活={activate}')
+            f'  [2/4] 发送切换请求: 停用={deactivate}, 激活={activate}, '
+            f'strictness=BEST_EFFORT, timeout=5.0s')
 
-        # 发送异步服务调用
         future = self.switch_controller_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+        self.get_logger().info('  [2/4] 切换请求已发送，等待响应（最长10秒）...')
 
-        if future.result() is None:
-            self.get_logger().error('  控制器切换调用超时.')
+        if not self._wait_for_future(future, timeout_sec=10.0):
+            self.get_logger().error('  [2/4] 控制器切换调用超时（10秒内未收到响应）!')
+            self.get_logger().error('  可能原因: controller_manager 节点无响应，或控制器切换卡住')
+            self.get_logger().error('  提示: 运行 `ros2 control list_controllers` 查看当前控制器状态')
             return False
 
-        return future.result().ok
+        result = future.result()
+        self.get_logger().info(f'  [3/4] 收到切换响应: ok={result.ok}')
+
+        if not result.ok:
+            self.get_logger().error('  [3/4] 控制器切换失败! controller_manager 返回 ok=False')
+            self.get_logger().error('  可能原因:')
+            self.get_logger().error(f'    - 停用的控制器不存在: {deactivate}')
+            self.get_logger().error(f'    - 激活的控制器不存在: {activate}')
+            self.get_logger().error('    - 控制器之间存在依赖冲突')
+            self.get_logger().error('    - 硬件接口不支持同时激活这些控制器')
+            self.get_logger().error('  提示: 运行 `ros2 control list_controllers` 确认控制器名称和状态')
+            self.get_logger().error('  提示: 运行 `ros2 control list_controller_types` 确认控制器类型')
+            return False
+
+        self.get_logger().info('  [4/4] 控制器切换成功!')
+        return True
 
     def execute_slide(self):
         """
@@ -482,7 +599,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
